@@ -19,6 +19,7 @@ link2ctl ptz [--pan DEG] [--tilt DEG] [--zoom X] [--home] [--nudge DIR]
 link2ctl preset list|save NAME|recall NAME|rm NAME
 link2ctl gestures [on|off|MASK]
 link2ctl denoise [on|off]
+link2ctl exposure [--auto] [--iso N] [--shutter N]
 link2ctl monitor              live ISO/shutter/mode readout
 link2ctl xu map|get|set       raw extension-unit access
 ```
@@ -35,8 +36,15 @@ internal.
 Controls that the driver reports as inactive — manual white balance while auto
 is on, for instance — are greyed out and come back automatically.
 
+**Exposure** — auto, or manual ISO (100–6400) and shutter (1/25–1/8000). Auto
+is the right default: it keeps the shutter on your mains frequency, so it will
+not band under artificial light. Lock it manually when you want the look to
+stay put between takes rather than drift as the room changes. If you pick a
+shutter that is not a multiple of the power line frequency, link2ctl says so.
+
 **Camera** — gesture control, microphone noise cancellation, and a live readout
-of the AI framing mode, ISO, shutter and serial.
+of the AI framing mode, ISO, shutter and serial. The AI framing mode is the one
+thing here that is read-only; see `PROTOCOL.md`.
 
 Settings are applied on the camera, so they persist across applications and
 survive unplugging the cable.

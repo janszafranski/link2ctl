@@ -22,8 +22,9 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gst, Gtk  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from link2ctl import (                                      # noqa: E402
-    APP_ID, ARCSEC_PER_DEGREE, CTRL_BOOLEAN, CTRL_INTEGER, CTRL_MENU,
-    GESTURE_BITS, GESTURE_MASK, V4L2_CTRL_FLAG_INACTIVE, Camera, XUError,
+    AE_AUTO, AE_MANUAL, APP_ID, ARCSEC_PER_DEGREE, CTRL_BOOLEAN, CTRL_INTEGER,
+    CTRL_MENU, GESTURE_BITS, GESTURE_MASK, ISO_MAX, ISO_MIN, SHUTTER_MAX,
+    SHUTTER_MIN, V4L2_CTRL_FLAG_INACTIVE, Camera, XUError,
     apply_preset, capture_preset, load_presets, save_presets,
 )
 
@@ -236,9 +237,34 @@ class Window(Adw.ApplicationWindow):
             self.presets_group.add(row)
             self._preset_rows.append(row)
 
+    def _exposure_group(self) -> Adw.PreferencesGroup:
+        group = Adw.PreferencesGroup(
+            title="Exposure",
+            description="Auto tracks the room and keeps the shutter on the "
+                        "mains frequency. Switch to manual only to stop it "
+                        "drifting between takes.")
+        self.manual_row = Adw.SwitchRow(
+            title="Manual exposure",
+            subtitle="Pin ISO and shutter instead of letting the camera decide")
+        self.manual_row.connect("notify::active", self._on_manual_toggled)
+        group.add(self.manual_row)
+
+        self.iso_row = Adw.SpinRow.new_with_range(ISO_MIN, ISO_MAX, 10)
+        self.iso_row.set_title("ISO")
+        self.iso_row.set_subtitle("Higher is brighter and noisier")
+        self.iso_row.connect("notify::value", self._on_iso_changed)
+        group.add(self.iso_row)
+
+        self.shutter_row = Adw.SpinRow.new_with_range(SHUTTER_MIN, SHUTTER_MAX, 1)
+        self.shutter_row.set_title("Shutter")
+        self.shutter_row.set_subtitle("1/N second")
+        self.shutter_row.connect("notify::value", self._on_shutter_changed)
+        group.add(self.shutter_row)
+        return group
+
     def _image_page(self) -> Gtk.Widget:
         page = Adw.PreferencesPage()
-        exposure = Adw.PreferencesGroup(title="Exposure and colour")
+        exposure = Adw.PreferencesGroup(title="Colour and detail")
         focus = Adw.PreferencesGroup(title="Focus")
         for slug in self.cam.controls:
             if slug in PTZ_SLUGS:
@@ -246,6 +272,7 @@ class Window(Adw.ApplicationWindow):
             row = self._row_for(slug)
             if row is not None:
                 (focus if "focus" in slug else exposure).add(row)
+        page.add(self._exposure_group())
         page.add(exposure)
         page.add(focus)
 
@@ -375,6 +402,27 @@ class Window(Adw.ApplicationWindow):
             self._updating = False
         self._tick()
 
+    def _sync_exposure(self):
+        """Mirror the camera's exposure state into the rows without writing back."""
+        manual = self.cam.ae_mode == AE_MANUAL
+        iso, shutter = self.cam.iso, self.cam.shutter
+        self._updating = True
+        try:
+            self.manual_row.set_active(manual)
+            # In auto these rows are a live readout and follow the sensor. In
+            # manual the user owns them, so leave them alone -- writing back on
+            # every tick would fight anyone mid-drag.
+            if not manual:
+                if iso:
+                    self.iso_row.set_value(min(max(iso, ISO_MIN), ISO_MAX))
+                if shutter:
+                    self.shutter_row.set_value(
+                        min(max(shutter, SHUTTER_MIN), SHUTTER_MAX))
+            self.iso_row.set_sensitive(manual)
+            self.shutter_row.set_sensitive(manual)
+        finally:
+            self._updating = False
+
     def _tick(self) -> bool:
         mode = self.cam.video_mode[1]
         iso, shutter = self.cam.iso, self.cam.shutter
@@ -383,6 +431,7 @@ class Window(Adw.ApplicationWindow):
         self.info_rows["shutter"].set_label(f"1/{shutter}s" if shutter else "—")
         self.info_rows["serial"].set_label(self.cam.serial)
         self.info_rows["device"].set_label(self.cam.path)
+        self._sync_exposure()
         return GLib.SOURCE_CONTINUE
 
     def _to_display(self, slug: str, value: int) -> float:
@@ -492,6 +541,38 @@ class Window(Adw.ApplicationWindow):
             for bit, row in self.gesture_switches.items():
                 row.set_active(bool(actual >> bit & 1))
             self._updating = False
+
+    def _on_manual_toggled(self, *_args):
+        if self._updating:
+            return
+        manual = self.manual_row.get_active()
+        try:
+            if manual:
+                # Carry the values auto had settled on, so flipping the switch
+                # holds the current look instead of jumping.
+                self.cam.set_iso(int(self.iso_row.get_value()))
+                self.cam.set_shutter(int(self.shutter_row.get_value()))
+            else:
+                self.cam.set_ae_mode(AE_AUTO)
+        except XUError as exc:
+            self._error(str(exc))
+        self._sync_exposure()
+
+    def _on_iso_changed(self, *_args):
+        if self._updating or not self.manual_row.get_active():
+            return
+        try:
+            self.cam.set_iso(int(self.iso_row.get_value()))
+        except XUError as exc:
+            self._error(str(exc))
+
+    def _on_shutter_changed(self, *_args):
+        if self._updating or not self.manual_row.get_active():
+            return
+        try:
+            self.cam.set_shutter(int(self.shutter_row.get_value()))
+        except XUError as exc:
+            self._error(str(exc))
 
     def _on_denoise_toggled(self, *_args):
         if self._updating:

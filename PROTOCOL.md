@@ -135,6 +135,40 @@ you. The list below separates what was proven from what was not.
 * **Telemetry reads**: serial (sel 12), ISO (sel 25) and shutter (sel 29) track
   real sensor state — ISO was observed moving between 2929 and 6393 as room
   lighting changed, so these are live readouts rather than stored values.
+* **Manual exposure**: AE mode (sel 30), ISO (sel 25) and shutter (sel 29) are
+  all writable, not just readable. Write `1` to sel 30 and the sensor stops
+  auto-exposing; `2` hands it back. Verified against captured frames, not just
+  readbacks — at a fixed 1/50s, mean frame luminance tracked ISO monotonically
+  (ISO 200 → 86, 500 → 154, 1600 → 207 on a 0–255 scale), and at a fixed ISO
+  500 the shutter did the same in reverse (1/25 → 159, 1/50 → 135, 1/100 → 96,
+  1/200 → 70).
+
+  Nothing on this path is range-checked. ISO 25600 and shutter 1/65535 are
+  accepted and read back verbatim; the frames stop changing long before that,
+  so the usable ranges are ISO 100–6400 (below 100 the sensor floors — ISO 25,
+  50 and 100 produce identical frames) and shutter 1/25–1/8000. Some shutter
+  values come back one lower than written: 1/30 lands on 1/29, 1/60 on 1/59.
+  `link2ctl` clamps to the measured ranges rather than trusting the firmware.
+
+  AE modes 0, 4 and 8 are also stored without complaint, but they behave as
+  undocumented auto variants that settle on 1/33s — not a multiple of either
+  mains frequency, so they band under artificial light. Only 1 and 2 are worth
+  using, and `link2ctl` only offers those two.
+
+### Writes are dropped if you rush them
+
+Extension-unit writes are not reliably synchronous. A write issued within
+~50 ms of the previous one is silently discarded: the ioctl returns success,
+the firmware ignores it, and the readback still shows the old value. Measured
+directly — a 0 ms and a 20 ms gap both drop the write, 50 ms and above land.
+The readback lags the write by a similar amount, so reading immediately after
+writing can report the *old* value even when the write did land.
+
+Under an active video stream even a correctly spaced write occasionally goes
+missing. So `link2ctl` does three things on this path: it spaces every XU write
+at least 100 ms apart, it waits before reading back, and it re-writes up to
+four times until the readback confirms the value. Without the retry, changing
+ISO while the GUI preview is running fails perhaps one time in six.
 * **Current AI framing mode**: byte 54 of sel 2, maintained by the firmware and
   read-only in practice.
 

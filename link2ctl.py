@@ -164,6 +164,26 @@ SEL_DEVICE_SN = 12
 SEL_USB_MODE_SWITCH = 17
 SEL_ISO = 25
 SEL_EXPOSURE_TIME = 29
+SEL_AE_MODE = 30
+
+# Only 1 and 2 are worth exposing. The firmware stores 0, 4 and 8 happily but
+# they behave as undocumented auto variants that settle on 1/33s, which bands
+# under 50 Hz mains -- see PROTOCOL.md.
+AE_MANUAL = 1
+AE_AUTO = 2
+AE_MODES = {0: "auto (variant 0)", AE_MANUAL: "manual", AE_AUTO: "auto",
+            4: "auto (variant 4)", 8: "auto (variant 8)"}
+
+# Nothing on this path is range-checked by the firmware: ISO 25600 and shutter
+# 1/65535 are both accepted and read back verbatim. These are the limits past
+# which measured frames stop changing, so we clamp in software instead.
+ISO_MIN, ISO_MAX = 100, 6400
+SHUTTER_MIN, SHUTTER_MAX = 25, 8000
+
+# Minimum spacing between extension-unit writes, and how many times to retry a
+# write the firmware silently ignored; see Camera.xu_write and _write_settled.
+XU_WRITE_GAP = 0.1
+XU_WRITE_TRIES = 4
 
 # Writing 2 or 3 here drops the camera out of UVC mode: it stops being a webcam
 # and reappears as mass storage or a vendor-class device. Never write it as a
@@ -204,6 +224,7 @@ class Camera:
         self.units: dict[uuid.UUID, int] = {}
         self.unit_controls: dict[int, int] = {}
         self._len_cache: dict[tuple[int, int], int] = {}
+        self._last_write = 0.0
         self._load_controls()
         if usb_dir:
             self._load_units(usb_dir)
@@ -407,7 +428,15 @@ class Camera:
         if len(data) != size:
             raise SystemExit(f"XU{unit} sel{selector} expects {size} bytes, "
                              f"got {len(data)}")
+        # A write issued within ~50 ms of the previous one is silently dropped:
+        # the ioctl succeeds, the firmware ignores it, and the readback still
+        # shows the old value. Measured on this hardware -- 50 ms fails, 50 ms
+        # plus margin always lands. Space writes out rather than lie about them.
+        wait = XU_WRITE_GAP - (time.monotonic() - self._last_write)
+        if wait > 0:
+            time.sleep(wait)
         self.xu(unit, selector, XU_SET_CUR, size, data)
+        self._last_write = time.monotonic()
 
     def _main(self, selector: int) -> tuple[int, int]:
         unit = self.main_unit
@@ -450,6 +479,58 @@ class Camera:
             return struct.unpack("<H", self.xu_read(*self._main(SEL_EXPOSURE_TIME)))[0]
         except (XUError, struct.error):
             return None
+
+    @property
+    def ae_mode(self) -> int | None:
+        try:
+            return self.xu_read(*self._main(SEL_AE_MODE))[0]
+        except (XUError, IndexError):
+            return None
+
+    def _write_settled(self, selector: int, data: bytes, read) -> int:
+        """Write an exposure selector and confirm the firmware took it.
+
+        Spacing writes out is necessary but not sufficient: while the camera is
+        streaming it still drops the occasional write, with no error on the
+        ioctl. So write, read back, and retry. The firmware rounds some shutter
+        values down by one, hence `abs(... ) <= 1` rather than equality.
+        """
+        want = struct.unpack("<H", data)[0]
+        got = None
+        for _ in range(XU_WRITE_TRIES):
+            self.xu_write(*self._main(selector), data)
+            time.sleep(XU_WRITE_GAP)        # the readback lags the write too
+            got = read()
+            if got is not None and abs(got - want) <= 1:
+                break
+        return got
+
+    def set_ae_mode(self, mode: int) -> int | None:
+        for _ in range(XU_WRITE_TRIES):
+            if self.ae_mode == mode:
+                return mode
+            self.xu_write(*self._main(SEL_AE_MODE), bytes([mode]))
+            time.sleep(XU_WRITE_GAP)
+        return self.ae_mode
+
+    def set_iso(self, iso: int) -> int:
+        """Pin the sensor gain. Implies manual exposure; returns the readback."""
+        self.set_ae_mode(AE_MANUAL)
+        return self._write_settled(
+            SEL_ISO, struct.pack("<H", max(ISO_MIN, min(ISO_MAX, iso))),
+            lambda: self.iso)
+
+    def set_shutter(self, denominator: int) -> int:
+        """Pin the exposure time to 1/denominator s. Implies manual exposure.
+
+        The firmware rounds some values down by one (1/30 lands on 1/29), so
+        the readback is what it actually took, not what we asked for.
+        """
+        self.set_ae_mode(AE_MANUAL)
+        return self._write_settled(
+            SEL_EXPOSURE_TIME,
+            struct.pack("<H", max(SHUTTER_MIN, min(SHUTTER_MAX, denominator))),
+            lambda: self.shutter)
 
     @property
     def device_status(self) -> bytes | None:
@@ -554,6 +635,9 @@ def cmd_info(cam: Camera, args) -> int:
     print(f"device         {cam.path}")
     print(f"serial         {cam.serial}")
     print(f"video mode     {mode_name}" + (f" ({mode_id})" if mode_id >= 0 else ""))
+    ae = cam.ae_mode
+    if ae is not None:
+        print(f"exposure       {AE_MODES.get(ae, f'mode {ae}')}")
     iso, shutter = cam.iso, cam.shutter
     if iso is not None:
         print(f"iso            {iso}")
@@ -717,6 +801,38 @@ def cmd_denoise(cam: Camera, args) -> int:
     return 0
 
 
+def cmd_exposure(cam: Camera, args) -> int:
+    wrote = args.auto or args.iso is not None or args.shutter is not None
+    if args.auto:
+        cam.set_ae_mode(AE_AUTO)
+    if args.iso is not None:
+        if not ISO_MIN <= args.iso <= ISO_MAX:
+            print(f"iso clamped to {max(ISO_MIN, min(ISO_MAX, args.iso))} "
+                  f"(usable range {ISO_MIN}-{ISO_MAX})")
+        cam.set_iso(args.iso)
+    if args.shutter is not None:
+        if not SHUTTER_MIN <= args.shutter <= SHUTTER_MAX:
+            print(f"shutter clamped to 1/{max(SHUTTER_MIN, min(SHUTTER_MAX, args.shutter))}s "
+                  f"(usable range 1/{SHUTTER_MIN}-1/{SHUTTER_MAX})")
+        got = cam.set_shutter(args.shutter)
+        if got != args.shutter and SHUTTER_MIN <= args.shutter <= SHUTTER_MAX:
+            print(f"firmware rounded 1/{args.shutter}s to 1/{got}s")
+    if wrote:
+        # ISO and shutter are live telemetry, not stored settings: give the
+        # firmware a beat to republish them before reporting what it did.
+        time.sleep(XU_WRITE_GAP)
+    ae, iso, shutter = cam.ae_mode, cam.iso, cam.shutter
+    print(f"exposure {AE_MODES.get(ae, f'mode {ae}')}  "
+          f"iso {iso}  shutter 1/{shutter}s")
+    line = cam.get("power_line_frequency")
+    if ae == AE_MANUAL and line in (1, 2) and shutter:
+        mains = 50 if line == 1 else 60
+        if shutter % mains:
+            print(f"warning: 1/{shutter}s is not a multiple of {mains} Hz -- "
+                  f"expect flicker banding. Try 1/{mains} or 1/{mains * 2}.")
+    return 0
+
+
 def cmd_monitor(cam: Camera, args) -> int:
     print("iso / shutter / mode / pan / tilt / zoom -- Ctrl+C to stop")
     try:
@@ -795,6 +911,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("denoise", help="microphone noise cancellation")
     p.add_argument("value", nargs="?", choices=("on", "off"))
 
+    p = sub.add_parser("exposure", help="auto or manual ISO and shutter")
+    p.add_argument("--auto", action="store_true", help="hand exposure back to the camera")
+    p.add_argument("--iso", type=int, metavar="N",
+                   help=f"pin sensor gain, {ISO_MIN}-{ISO_MAX} (implies manual)")
+    p.add_argument("--shutter", type=int, metavar="N",
+                   help=f"pin exposure to 1/N s, {SHUTTER_MIN}-{SHUTTER_MAX} "
+                        "(implies manual)")
+
     p = sub.add_parser("monitor", help="live telemetry")
     p.add_argument("--interval", type=float, default=0.5)
 
@@ -810,7 +934,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 COMMANDS = {"info": cmd_info, "list": cmd_list, "get": cmd_get, "set": cmd_set,
             "ptz": cmd_ptz, "preset": cmd_preset, "gestures": cmd_gestures,
-            "denoise": cmd_denoise, "monitor": cmd_monitor, "xu": cmd_xu}
+            "denoise": cmd_denoise, "exposure": cmd_exposure,
+            "monitor": cmd_monitor, "xu": cmd_xu}
 
 
 def main(argv=None) -> int:
