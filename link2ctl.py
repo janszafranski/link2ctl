@@ -185,13 +185,31 @@ SHUTTER_MIN, SHUTTER_MAX = 25, 8000
 XU_WRITE_GAP = 0.1
 XU_WRITE_TRIES = 4
 
-# Writing 2 or 3 here drops the camera out of UVC mode: it stops being a webcam
-# and reappears as mass storage or a vendor-class device. Never write it as a
-# side effect of anything.
-DANGEROUS = {SEL_USB_MODE_SWITCH}
+# Writing either of these takes the camera off the USB bus, so neither is ever
+# written as a side effect of anything. Keyed by unit GUID, not unit number --
+# the numbers are firmware-assigned and not contractual.
+#
+# Main sel 17: writing 2 or 3 drops the camera out of UVC mode; it stops being
+# a webcam and reappears as mass storage or a vendor-class device.
+#
+# Tracking sel 17: measured on this hardware. Writing it made the device vanish
+# from the bus entirely -- gone from lsusb and /dev/video*, not merely remoded.
+# The SET ioctl returned ETIMEDOUT and the camera re-enumerated by itself about
+# five seconds later, so it is a firmware reboot rather than a mode change.
+DANGEROUS = {
+    (XU_MAIN_GUID, SEL_USB_MODE_SWITCH):
+        "switches the camera out of webcam mode; it will vanish from "
+        "/dev/video* until it is re-enumerated",
+    (XU_TRACK_GUID, 17):
+        "reboots the camera; it drops off the USB bus entirely and comes "
+        "back a few seconds later",
+}
 
-# sel 2 is a 56-byte view-state record. Byte 54 is the current video mode,
-# maintained by the firmware and read-only in practice.
+# sel 2 is a 56-byte live view-state record. Byte 54 is the current video mode.
+# It is read-only: writing the record back with byte 54 changed is ignored, and
+# so are six other encodings of the same request, with and without a live
+# preview stream. The real setter takes (mode, hostpitch, ptz_check_result) and
+# has not been located yet -- see PROTOCOL.md.
 VIDEO_MODE_OFFSET = 54
 VIDEO_MODES = {
     0: "Normal", 1: "Auto composition", 2: "Tracking", 4: "Whiteboard",
@@ -417,13 +435,20 @@ class Camera:
     def xu_read(self, unit: int, selector: int) -> bytes:
         return self.xu(unit, selector, XU_GET_CUR, self.xu_len(unit, selector))
 
+    def unit_guid(self, unit: int) -> uuid.UUID | None:
+        for guid, number in self.units.items():
+            if number == unit:
+                return guid
+        return None
+
     def xu_write(self, unit: int, selector: int, data: bytes, force: bool = False):
-        if unit == self.main_unit and selector in DANGEROUS and not force:
+        harm = DANGEROUS.get((self.unit_guid(unit), selector))
+        if harm and not force:
+            name = (XU_MAIN_SELECTORS.get(selector, "?")
+                    if unit == self.main_unit else "?")
             raise SystemExit(
-                f"refusing to write XU{unit} sel{selector} "
-                f"({XU_MAIN_SELECTORS.get(selector, '?')}): this switches the "
-                f"camera out of webcam mode and it will vanish from /dev/video*. "
-                f"Pass --force if you really mean it.")
+                f"refusing to write XU{unit} sel{selector} ({name}): this "
+                f"{harm}. Pass --force if you really mean it.")
         size = self.xu_len(unit, selector)
         if len(data) != size:
             raise SystemExit(f"XU{unit} sel{selector} expects {size} bytes, "
@@ -855,24 +880,35 @@ def cmd_monitor(cam: Camera, args) -> int:
 def cmd_xu(cam: Camera, args) -> int:
     unit = cam.main_unit if args.unit is None else args.unit
     if args.action == "map":
-        for sel in sorted(XU_MAIN_SELECTORS):
+        guid = cam.unit_guid(unit)
+        # Only the main unit has known selector names; for the others the
+        # device's own control count is all we have to go on.
+        count = cam.unit_controls.get(unit, max(XU_MAIN_SELECTORS))
+        for sel in range(1, count + 1):
             try:
                 size, info = cam.xu_len(unit, sel), cam.xu_info(unit, sel)
             except XUError:
                 continue
             access = ("r" if info & XU_INFO_GET else "-") + \
                      ("w" if info & XU_INFO_SET else "-")
-            warn = "  !! changes USB mode" if sel in DANGEROUS else ""
+            harm = DANGEROUS.get((guid, sel))
+            warn = f"  !! {harm}" if harm else ""
+            name = XU_MAIN_SELECTORS.get(sel, "?") if guid == XU_MAIN_GUID else "?"
             unit_word = "byte " if size == 1 else "bytes"
             print(f"  sel {sel:<3} {access}  {size:>4} {unit_word}  "
-                  f"{XU_MAIN_SELECTORS.get(sel, '?')}{warn}")
+                  f"{name}{warn}")
         return 0
     if args.action == "get":
         print(cam.xu_read(unit, args.selector).hex(" "))
         return 0
     data = bytes.fromhex(args.data.replace(" ", ""))
     cam.xu_write(unit, args.selector, data, force=args.force)
-    print(cam.xu_read(unit, args.selector).hex(" "))
+    # Several selectors on the tracking and framing units are write-only, so a
+    # readback is a bonus rather than a result.
+    try:
+        print(cam.xu_read(unit, args.selector).hex(" "))
+    except XUError as exc:
+        print(f"written; no readback ({exc})")
     return 0
 
 
