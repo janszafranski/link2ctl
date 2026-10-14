@@ -205,17 +205,34 @@ DANGEROUS = {
         "back a few seconds later",
 }
 
-# sel 2 is a 56-byte live view-state record. Byte 54 is the current video mode.
-# It is read-only: writing the record back with byte 54 changed is ignored, and
-# so are six other encodings of the same request, with and without a live
-# preview stream. The real setter takes (mode, hostpitch, ptz_check_result) and
-# has not been located yet -- see PROTOCOL.md.
+# Sel 2 is a 56-byte view-state record, and it reads and writes *different*
+# layouts. On a read, byte 54 carries the framing mode; on a write, byte 0 does,
+# and the firmware echoes the written mode back in byte 0. Everything else in
+# the write record is a "leave it alone" sentinel -- see PROTOCOL.md.
 VIDEO_MODE_OFFSET = 54
+VIDEO_MODE_SET_OFFSET = 0
+VIDEO_MODE_PAN_OFFSET = 38       # pan, tilt and roll, int32 each, 0.1 deg
+VIDEO_MODE_PITCH_OFFSET = 52     # host pitch, int16, 0.1 deg
+PTZ_KEEP = 3610                  # 361.0 deg: do not move this axis
+HOST_PITCH_DEFAULT = -450        # -45.0 deg, the Windows app's own default
+VIDEO_MODE_SETTLE = 1.5          # how long entering a mode takes to show up
 VIDEO_MODES = {
     0: "Normal", 1: "Auto composition", 2: "Tracking", 4: "Whiteboard",
     5: "Overhead", 6: "DeskView", 7: "Auto framing", 8: "Smart whiteboard",
     9: "Regional track",
 }
+
+# Modes a write can select. Whiteboard, smart whiteboard and the two
+# query/config operations take a corner-geometry blob this tool does not build,
+# so they are not offered rather than written half-formed.
+SETTABLE_MODES = {
+    "normal": 0, "auto-composition": 1, "tracking": 2, "overhead": 5,
+    "deskview": 6, "auto-framing": 7,
+}
+
+# What byte 0 reads back as after each mode is written. The firmware echoes the
+# mode for every value here except tracking, which reports as auto composition.
+VIDEO_MODE_ECHO = {0: 0, 1: 1, 2: 1, 5: 5, 6: 6, 7: 7}
 
 # Of the five bits sel 5 defines, this firmware only honours bits 1-3; it
 # silently clears the rest (0x1f reads back as 0x0e).
@@ -490,6 +507,42 @@ class Camera:
             return -1, "unknown"
         mode = raw[VIDEO_MODE_OFFSET]
         return mode, VIDEO_MODES.get(mode, f"mode {mode}")
+
+    def video_mode_payload(self, mode: int,
+                           pitch: int = HOST_PITCH_DEFAULT) -> bytes:
+        """The 56-byte write record for `mode`, as the Windows app builds it."""
+        data = bytearray(56)
+        data[VIDEO_MODE_SET_OFFSET] = mode
+        # Pan, tilt and roll are "keep" sentinels: entering a mode is not a
+        # gimbal move, and the modes that do move it (overhead, DeskView) work
+        # the pitch out from the mode itself.
+        struct.pack_into("<iii", data, VIDEO_MODE_PAN_OFFSET,
+                         PTZ_KEEP, PTZ_KEEP, PTZ_KEEP)
+        struct.pack_into("<h", data, VIDEO_MODE_PITCH_OFFSET, pitch)
+        return bytes(data)
+
+    def set_video_mode(self, mode: int,
+                       pitch: int = HOST_PITCH_DEFAULT) -> int | None:
+        """Switch the AI framing mode; returns byte 0 as the camera echoes it.
+
+        The echo is what the firmware acknowledges, and it is not always the
+        value written -- tracking comes back as auto composition. Compare
+        against VIDEO_MODE_ECHO rather than against `mode`.
+        """
+        unit, selector = self._main(SEL_VIDEO_MODE)
+        want = VIDEO_MODE_ECHO.get(mode, mode)
+        echo = None
+        for _ in range(XU_WRITE_TRIES):
+            self.xu_write(unit, selector, self.video_mode_payload(mode, pitch))
+            # Entering a mode is slow -- the camera re-frames, and on overhead
+            # and DeskView it swings the gimbal -- and byte 0 reads back as
+            # "no preset" until it has settled. Reading at the usual 100 ms
+            # sees nothing, and writing again that fast makes it worse.
+            time.sleep(VIDEO_MODE_SETTLE)
+            echo = self.xu_read(unit, selector)[VIDEO_MODE_SET_OFFSET]
+            if echo == want:
+                break
+        return echo
 
     @property
     def iso(self) -> int | None:
@@ -826,6 +879,28 @@ def cmd_denoise(cam: Camera, args) -> int:
     return 0
 
 
+def cmd_mode(cam: Camera, args) -> int:
+    if args.value is not None:
+        key = args.value.lower().replace("_", "-")
+        if key not in SETTABLE_MODES:
+            raise SystemExit(f"unknown mode {args.value!r}; pick one of "
+                             f"{', '.join(SETTABLE_MODES)}")
+        mode = SETTABLE_MODES[key]
+        pitch = args.pitch if args.pitch is not None else HOST_PITCH_DEFAULT
+        echo = cam.set_video_mode(mode, pitch)
+        if echo != VIDEO_MODE_ECHO.get(mode, mode):
+            print(f"the camera did not take {VIDEO_MODES.get(mode, mode)}. "
+                  "It only accepts a framing-mode change while something is "
+                  "streaming from it -- open the preview, or any camera app, "
+                  "and try again.")
+            return 1
+        print(f"framing mode {VIDEO_MODES.get(mode, mode)}")
+        return 0
+    mode, name = cam.video_mode
+    print(f"framing mode {name} ({mode})")
+    return 0
+
+
 def cmd_exposure(cam: Camera, args) -> int:
     wrote = args.auto or args.iso is not None or args.shutter is not None
     if args.auto:
@@ -947,6 +1022,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("denoise", help="microphone noise cancellation")
     p.add_argument("value", nargs="?", choices=("on", "off"))
 
+    p = sub.add_parser("mode", help="read or set the AI framing mode")
+    p.add_argument("value", nargs="?", choices=tuple(SETTABLE_MODES))
+    p.add_argument("--pitch", type=int, metavar="TENTHS",
+                   help="host pitch in 0.1 deg for DeskView (default "
+                        f"{HOST_PITCH_DEFAULT})")
+
     p = sub.add_parser("exposure", help="auto or manual ISO and shutter")
     p.add_argument("--auto", action="store_true", help="hand exposure back to the camera")
     p.add_argument("--iso", type=int, metavar="N",
@@ -970,7 +1051,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 COMMANDS = {"info": cmd_info, "list": cmd_list, "get": cmd_get, "set": cmd_set,
             "ptz": cmd_ptz, "preset": cmd_preset, "gestures": cmd_gestures,
-            "denoise": cmd_denoise, "exposure": cmd_exposure,
+            "denoise": cmd_denoise, "mode": cmd_mode, "exposure": cmd_exposure,
             "monitor": cmd_monitor, "xu": cmd_xu}
 
 

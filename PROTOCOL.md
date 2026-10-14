@@ -246,12 +246,17 @@ missing. So `link2ctl` does three things on this path: it spaces every XU write
 at least 100 ms apart, it waits before reading back, and it re-writes up to
 four times until the readback confirms the value. Without the retry, changing
 ISO while the GUI preview is running fails perhaps one time in six.
-* **Current AI framing mode**: byte 54 of sel 2, maintained by the firmware and
-  read-only in practice.
+* **The AI framing mode** (sel 2). Normal, auto composition, tracking, overhead
+  and DeskView all switch, and the camera proves it physically: overhead drives
+  the tilt axis to −90.0°, DeskView to the host pitch in the request. See
+  "Changing the AI framing mode" for the two conditions that have to hold.
 
-### Not solved: changing the AI framing mode
+### Changing the AI framing mode
 
-Selector 2 is a 56-byte view-state record:
+Selector 2 reads and writes **two different layouts**. Missing that is what
+made this look unsolvable for so long.
+
+On a read it is the live view-state record:
 
 ```
 [0]      preset index (0xff = none)
@@ -260,8 +265,25 @@ Selector 2 is a 56-byte view-state record:
 [42..45] int32  tilt, 0.1°
 [46..49] int32  roll
 [50..53] int32  zoom ×100
-[54]     current video mode   <- read-only
+[54]     framing mode
 [55]     reserved
+```
+
+On a write it is the mode-change request, and the mode moves to **byte 0**:
+
+```
+[0]      target video mode
+[1]      0
+[2..37]  mode geometry blob: 36 bytes for whiteboard (mode 4), 32 bytes for
+         smart whiteboard (8) and its query (10), zero for every other mode
+[38..41] int32  pan,  0.1°   — 3610 (361.0°) means "do not move this axis"
+[42..45] int32  tilt, 0.1°   — same sentinel
+[46..49] int32  roll         — same sentinel
+[50..51] int16  0
+[52..53] int16  host pitch, 0.1° — -450 is the app's default, and DeskView
+         parks the gimbal at exactly this angle
+[54..55] uint16 flags; bit 1 is set from the host's PTZ feasibility check,
+         and the app sends 0 here for an ordinary mode change
 ```
 
 `VideoModeType`, decoded from the binary's own `device.proto` descriptor:
@@ -272,81 +294,78 @@ Selector 2 is a 56-byte view-state record:
 independent firmware notes. The last two are query/config operations rather
 than framing modes, so a tool should not offer them as modes.
 
-#### Byte 54 is not the write path
+#### Two conditions, both mandatory
 
-**Sel 2 is a read-only mirror of the live view state, and writing it does
-nothing.** This is now a measured negative result rather than an assumption.
-Seven payload encodings were tried — the record exactly as read with byte 54
-replaced; the same with byte 0 forced to `0xff`; with byte 55 set as a flag;
-all-zero records with the mode at byte 54 and at byte 0 — each retried four
-times with a 3-second poll for the mode to move, all with a live 1080p MJPEG
-preview running to satisfy the app's "preview is closed! Waiting for
-opening..." precondition. Byte 54 never budged off the firmware's own value.
+* **Something must be streaming from the camera.** With no stream open the
+  write is accepted by the ioctl and ignored by the firmware, every time. This
+  is the same precondition the app logs as `preview is closed! Waiting for
+  opening...`. `link2ctl mode` says so rather than pretending it worked.
+* **Give it time, and do not hammer it.** Entering a mode takes over a second
+  — the camera re-frames, and overhead and DeskView swing the gimbal. Byte 0
+  reads back `0xff` until it settles, and writing again at the usual 100 ms
+  write spacing makes it worse rather than better. 1.5 s between the write and
+  the readback works; four tries at 100 ms does not.
 
-Sel 2 *is* genuinely live, which is what makes the negative result meaningful:
-with the camera at zoom 1.70× the zoom field read `0xaa` = 170, and byte 0
-reads `0xff` ("no preset") rather than the `0x00` seen earlier.
+#### How this was traced
 
-#### What the binary says the real path is
+`Webcam::CameraInsta::setVideoModeToCamera` (`0x140bf8180`) calls
+`SetVideoMode(mode, aux)` on the object at `CameraInsta+0x2c8`. That member is
+a `shared_ptr<uvc::UVCCameraExtendController>`, which is a 16-byte pimpl whose
+forwarders look like `mov rcx,[rcx]; mov rax,[rcx]; jmp [rax+0x30]` — so the
+call is slot 6 of the implementation. RTTI names the implementation
+`WinUVCCameraExtendController` (vtable `0x14c8c6dd0`), whose slot 6 is
+`0x140e2a4e0`: the function that builds the record above and hands it to
+`0x140e27ca0`, which issues a KS property set with
 
-The app's own call graph rules sel 2 out directly:
+* the property set GUID `faf1672d-b71b-4793-8c91-7b1c9b7f95f8` — **unit 9**,
+* property Id **2** — the control selector,
+* flags `0x10000002`, i.e. `KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_TOPOLOGY`.
 
-* `Webcam::CameraInsta::AddCurrentPTZInfo` builds a preset by reading the video
-  mode, the pan/tilt and the roll as **three separate** calls (`faile to get
-  video mode from uvc_extend`, `faile to get pan tilt absolute value from
-  uvc_extend`, `failed to get roll absolute value from uvc`). If the mode lived
-  in the pan/tilt record, that would be one read, not three.
-* `Webcam::CameraInsta::setPitch` logs `set host pitch to …` and then
-  `failed to set video mode` — setting the host pitch is routed *through* the
-  video-mode setter, so the setter takes a pitch argument.
-* `Webcam::CameraInsta::setVideoModeToCamera` logs `Set DeskView mode with
-  hostpitch: …`, confirming the same.
+`tools/vtable.py` resolves a class name to its vtable through RTTI, which is
+how the implementation class was identified rather than guessed.
 
-So the setter is `SetVideoMode(mode, aux)` where `aux` is the host-side struct
-`VideoModeAuxiliaryData { mode, flag, hostpitch, ptz_check_result }` — a C++
-struct, *not* a protobuf message (it appears only in Qt signal signatures and
-log strings, never in a `FileDescriptorProto`). The host has to supply a
-`ptz_check_result`, i.e. it performs a PTZ feasibility check and reports the
-answer as part of entering the mode. That is consistent with
-`can`t use deskview on vertical resolution!!!` and with the dedicated
-`enterDeskViewFailed` / `enterWhiteBoardFailed` signals.
+Two cautions this cost us. The first is in "Reproducing the binary analysis":
+none of the above was followable until the Inno Setup call transform was
+undone. The second is that `setVideoModeToCamera` fills the aux struct with
+defaults and calls `SetVideoMode` almost immediately — the exit/poll/re-enter
+handshake in the log strings below wraps that call, it does not replace it.
 
-Around that sits a retried, acknowledged handshake:
+#### What the earlier negative result got wrong
 
-```
-exit from video mode: %d, then enter tracking mode
-remaining times:
-uvc transmission failed! Ready to exit track mode
-preview is closed! Waiting for opening...
-onSetVideoModeTimeOut / enterVideoModeFailed
-video mode hasn`t changed from %d yet! should delay setting zoom.
-```
+A previous sweep concluded that sel 2 is a read-only mirror, having tried seven
+encodings that all put the mode at byte 54 or sent an all-zero record. Byte 54
+is where the mode is *reported*, not where it is *set*, and an all-zero record
+has pan/tilt/roll of 0.0° rather than the 3610 "keep" sentinel. The conclusion
+was wrong but the measurement was honest: those seven encodings really do
+nothing.
 
-You leave the current mode, poll until the camera confirms, then enter the
-next, retrying a bounded number of times — and zoom changes must be deferred
-until the mode has actually flipped.
+#### Confirmed against the hardware
 
-#### Which selector carries it — still open
+Not by readback alone — this firmware will happily report a value it did not
+act on:
 
-A sweep of the plausible writable selectors (main 1, 4, 9, 14, 15, 18, 19, 21,
-27, 28; framing 2, 4, 5; tracking 6, 9, 10) writing the target mode as the
-first byte, with a live preview, moved the mode in **none** of them. The sweep
-did not complete: tracking sel 17 rebooted the camera partway through, and
-every later probe in that run failed spuriously with `No such device`, so
-tracking selectors 3, 4, 7, 8, 11, 12, 13, 15, 18, 19, 20, 22, 23, 25 and 26
-remain genuinely untested. They are the obvious place to look next, but they
-are also the unit that reboots the camera when poked, so the next attempt
-wants the exact payload in hand first rather than another blind sweep.
+* **Overhead (5) drives the tilt axis to -900 (-90.0°)**, straight down.
+* **DeskView (6) parks it at -450 (-45.0°)**, exactly the host pitch sent in
+  bytes 52-53. Sending a different `--pitch` moves that angle with it.
+* Entering auto framing (7) from tracking took the zoom field from 130 to 102
+  and the captured 1080p MJPEG frame visibly widened.
+* Byte 0 echoes the written mode for 0, 1, 5, 6 and 7. **Tracking (2) echoes
+  as 1**, not 2 — so a tool must compare against that mapping, not against the
+  value it wrote. Mode 9 was not accepted at all.
 
-Getting that payload means disassembling `SetVideoMode`. The caller
-`setVideoModeToCamera` was located (`0x140bf8180`–`0x140bf920c` at image base
-`0x140000000`), but following it to the UVC transport stalled for a reason that
-had nothing to do with the camera: the extracted binary's call targets were
-wrong, because Inno Setup's call-instruction transform had never been undone
-(see "Reproducing the binary analysis"). Earlier call-graph conclusions drawn
-from that carve are void and need re-deriving on a `verify_pe.py`-VERIFIED
-image. Until the payload is known the mode stays read-only, rather than
-shipping a toggle that silently does nothing.
+#### Still open
+
+* What byte 54 actually tracks. It is not the live mode: it sat at 2 while
+  modes 0, 2, 5 and 6 were entered, and flipped to 0 and back to 2 on
+  transitions that do not correspond to the value written. `link2ctl` still
+  reports it as the current mode, which is how the camera's own app presents
+  it, but that reading is not yet earned.
+* Why tracking reports as auto composition.
+* Whiteboard (4) and smart whiteboard (8) need the corner-geometry blob at
+  bytes 2-37. `link2ctl mode` does not offer them rather than send a
+  half-formed record.
+* `link2ctl ptz` reads a stale pan/tilt/zoom during a mode change while sel 2
+  shows the gimbal moving. Separate bug, in the PTZ read path.
 
 ### Deliberately not attempted
 

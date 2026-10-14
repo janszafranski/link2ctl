@@ -42,9 +42,18 @@ not band under artificial light. Lock it manually when you want the look to
 stay put between takes rather than drift as the room changes. If you pick a
 shutter that is not a multiple of the power line frequency, link2ctl says so.
 
-**Camera** — gesture control, microphone noise cancellation, and a live readout
-of the AI framing mode, ISO, shutter and serial. The AI framing mode is the one
-thing here that is read-only; see `PROTOCOL.md`.
+**Camera** — gesture control, microphone noise cancellation, the AI framing
+mode, and a live readout of ISO, shutter and serial.
+
+```sh
+link2ctl mode                 # what the camera reports now
+link2ctl mode deskview        # normal, auto-composition, tracking,
+link2ctl mode overhead        # overhead, deskview, auto-framing
+```
+
+The camera only accepts a framing-mode change **while something is streaming
+from it** — open the preview, or any camera app, first. `link2ctl mode` tells
+you when it did not take rather than pretending it worked.
 
 Settings are applied on the camera, so they persist across applications and
 survive unplugging the cable.
@@ -74,12 +83,10 @@ path.
 
 ## What it does not do
 
-**Changing the AI framing mode** (Tracking / DeskView / Whiteboard / Overhead)
-is read-only here. The current mode is reported, but setting it needs a retried
-handshake with the camera that is not yet reverse-engineered — see
-[PROTOCOL.md](PROTOCOL.md). Rather than ship a button that silently does
-nothing, the mode is shown and not offered as a control. Use the gesture
-controls or the button on the camera to switch modes meanwhile.
+**Whiteboard and smart whiteboard framing.** The other framing modes switch
+(`link2ctl mode`), but these two carry a corner-geometry blob that has not been
+worked out, so they are not offered rather than sent half-formed. Use the
+gesture controls or the button on the camera for those meanwhile.
 
 **Background blur, background replacement, green screen and beauty filters** are
 not camera features. The Windows app runs those on the PC with its own CV models

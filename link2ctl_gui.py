@@ -326,10 +326,9 @@ class Window(Adw.ApplicationWindow):
             description="Background blur, background replacement, green screen "
                         "and beauty filters are not camera features — the "
                         "Windows app renders them on the PC and feeds the "
-                        "result to a virtual camera. The AI framing mode is set "
-                        "on the camera itself and is reported above, but the "
-                        "command that changes it is not yet understood; see "
-                        "PROTOCOL.md.")
+                        "result to a virtual camera. The AI framing mode is "
+                        "reported above and can be changed from the command "
+                        "line with `link2ctl mode`; see PROTOCOL.md.")
         page.add(note)
         return page
 
