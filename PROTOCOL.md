@@ -11,8 +11,9 @@ for name/number pairs, so the numbers below are now confirmed twice over by
 independent means.
 
 The Windows installer is Inno Setup 6.3, which the packaged `innoextract` 1.9
-cannot read; current `innoextract` (1.10-dev) unpacks it. The payload is a Qt 6
-application, `app/Insta360 Link Controller.exe` (208 MB), which embeds its
+cannot read; `tools/extract_app_exe.py` unpacks it and `tools/verify_pe.py`
+proves the result byte-identical to what the vendor signed. The payload is a
+Qt 6 application, `app/Insta360 Link Controller.exe` (208 MB), which embeds its
 protobuf `FileDescriptorProto` blobs. Those descriptors carry the vendor's own
 `ControlSelector`, `ParamType` and `VideoModeType` enums with their numeric
 values, which is where the selector names below come from — they are not
@@ -339,9 +340,13 @@ wants the exact payload in hand first rather than another blind sweep.
 
 Getting that payload means disassembling `SetVideoMode`. The caller
 `setVideoModeToCamera` was located (`0x140bf8180`–`0x140bf920c` at image base
-`0x140000000`) and its call into the camera wrapper identified, but following
-it to the UVC transport is unfinished. It is left unimplemented rather than
-shipped as a toggle that silently does nothing.
+`0x140000000`), but following it to the UVC transport stalled for a reason that
+had nothing to do with the camera: the extracted binary's call targets were
+wrong, because Inno Setup's call-instruction transform had never been undone
+(see "Reproducing the binary analysis"). Earlier call-graph conclusions drawn
+from that carve are void and need re-deriving on a `verify_pe.py`-VERIFIED
+image. Until the payload is known the mode stays read-only, rather than
+shipping a toggle that silently does nothing.
 
 ### Deliberately not attempted
 
@@ -374,17 +379,34 @@ innoextract -e -I "app/Insta360 Link Controller.exe" "Insta360LinkController_2.2
 grep -aoP '\x0a.[A-Z_]{4,40}\x10' "app/Insta360 Link Controller.exe"
 ```
 
-If no 1.10-dev `innoextract` is available (the distro package is 1.9, and
-building it needs Boost *headers*, not just the `boost-libs` runtime), the
-payload can be reached directly: the installer carries two `zlb\x1a` LZMA1
-blocks, and decompressing the first one with `lzma.FORMAT_RAW` — reading the
-one-byte `lc/lp/pb` properties and the 4-byte dictionary size that follow the
-magic — yields ~1.25 GB containing every packaged file. The 208 MB app exe
-starts at the first `MZ` whose `PE\0\0` signature checks out, and its length
-matches the section table exactly, so it can be carved out and fed to
-`objdump -d -M intel --start-address=…`.
+No 1.10-dev `innoextract` is needed, and no Boost headers either. `tools/`
+does the whole job in about eight seconds:
 
-Two cautions, both learned by getting them wrong:
+```sh
+tools/extract_app_exe.py "Insta360LinkController_2.2.4(build14).exe" app.exe
+tools/verify_pe.py app.exe          # must print VERIFIED
+```
+
+The installer carries two `zlb\x1a` LZMA1 blocks; decompressing the first one
+with `lzma.FORMAT_RAW` — reading the one-byte `lc/lp/pb` properties and the
+4-byte dictionary size that follow the magic — yields ~1.25 GB containing every
+packaged file. The 208 MB app exe starts at the first `MZ` whose `PE\0\0`
+signature checks out, and its length matches the section table exactly.
+
+**Decompressing is not enough, and this cost a lot of time.** Inno Setup
+rewrites every `CALL rel32` / `JMP rel32` operand in a stored executable to an
+*absolute* address before compressing it, because absolute targets repeat and
+so compress better. The transform has to be undone afterwards
+(`tools/inno_exe_unfilter.py`, the inverse of innoextract's
+`inno_exe_decoder_5200` with `flip_high_byte`, which is the encoding used from
+Inno Setup 5.3.9 on). Skip it and you get a PE that is structurally perfect,
+loads in any disassembler, has correct headers, correct `.pdata`, correct
+strings, correct rip-relative data references — and in which **every long call
+and jump points somewhere wrong**. In `setVideoModeToCamera` alone, 38 of 92
+direct call/jump targets were bogus; only 14 of them landed on a `.pdata`
+function start, against 44 after the transform is undone.
+
+Three cautions, all learned by getting them wrong:
 
 * **Don't trust the enum numbers to a `grep`.** Decode the embedded
   `FileDescriptorProto` blobs properly instead; `WebTransport.proto`,
@@ -392,14 +414,18 @@ Two cautions, both learned by getting them wrong:
   descriptor parse is itself an integrity check on those bytes, which a string
   grep is not. That is where the tables in this document come from —
   `ControlSelector` runs 1–30 and matches this unit's selector count exactly.
-* **Don't measure extraction integrity by scanning for `0xe8` call bytes and
-  checking whether the targets land on `.pdata` function starts.** A linear
-  byte scan over 31 MB of code is overwhelmingly false positives, and the
-  resulting hit rate looks like catastrophic corruption even on a perfectly
-  good file. The honest check is to disassemble each `.pdata` function from its
-  recorded `BeginAddress` to its `EndAddress` and confirm the sweep stays in
-  sync and emits no `(bad)` instructions. On a correct extraction that passes
-  for essentially every function.
+* **"It disassembles without `(bad)` instructions" is not an integrity check.**
+  The Inno transform only edits 4-byte operands, so instruction lengths are
+  untouched and a fully corrupted file sweeps `.pdata` from `BeginAddress` to
+  `EndAddress` in perfect sync. The same goes for string and data references:
+  rip-relative displacements survive the transform, so a resolved
+  `camera_insta.cc` string proves nothing about the call graph.
+* **Verify extraction cryptographically; the file hands you the means.** The
+  exe is Authenticode-signed, so the publisher's own SHA-256 over the image is
+  embedded in it, and the PE `CheckSum` field is a second, independent witness.
+  `tools/verify_pe.py` checks both, and both have to say MATCH before any call
+  target in the binary is worth following. A carve that fails either one can
+  still look flawless in a disassembler.
 
 `link2ctl xu map` prints the live selector map from whatever camera is attached,
 with lengths and access bits read from the device rather than from this file.
